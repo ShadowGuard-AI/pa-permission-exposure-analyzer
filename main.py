@@ -74,6 +74,9 @@ class PermissionExposureAnalyzer:
             dirs[:] = [
                 d for d in dirs if not self.is_excluded(os.path.join(root, d))
             ]
+            # Directory permissions are never analysed. Only files get
+            # permission edges below, so a directory with no traverse
+            # bit still shows its contents as exposed in the result.
             # Add directory node
             self.add_node(root, "directory")
             for file in files:
@@ -127,6 +130,10 @@ class PermissionExposureAnalyzer:
             )
             logging.debug(f"Added relation to edge: {source} -> {target} (relation: {relation})")
 
+    # The principal here is the literal word owner, group, or others,
+    # shared across the whole tree. Files owned by different accounts
+    # all attach to the same owner node, so the result answers what the
+    # owner class can reach, never what one named person can reach.
     def analyze_file_permissions(self, file_path):
         """
         Analyzes the permissions of a file and adds corresponding edges to the graph.
@@ -179,6 +186,10 @@ class PermissionExposureAnalyzer:
         Returns:
             list: A list of paths to nodes that are affected.
         """
+        # This is one hop only. I look for a direct permission edge
+        # from the principal and never follow contains edges or chain
+        # through directories, so the blast radius is the set of files
+        # with that exact bit, not everything reachable through them.
         affected_nodes = []
         for node in self.graph.nodes():
             edge_data = self.graph.get_edge_data(principal, node)
