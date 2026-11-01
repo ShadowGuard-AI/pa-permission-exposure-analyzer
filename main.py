@@ -1,4 +1,5 @@
 import argparse
+import fnmatch
 import logging
 import os
 import sys
@@ -8,12 +9,10 @@ try:
     import networkx as nx
     from rich.console import Console
     from rich.table import Table
-    from pathspec import PathSpec
-    from pathspec.patterns import GitWildMatchPattern
 
 except ImportError as e:
     print(f"Error importing required libraries: {e}")
-    print("Please install the required packages: pip install networkx rich pathspec")
+    print("Please install the required packages: pip install networkx rich")
     sys.exit(1)
 
 
@@ -31,19 +30,39 @@ class PermissionExposureAnalyzer:
     within a file system structure represented as a graph.
     """
 
-    def __init__(self, root_path):
+    def __init__(self, root_path, exclude_patterns=None):
         """
         Initializes the analyzer with a root path to analyze.
 
         Args:
             root_path (str): The root directory to start the permission analysis.
+            exclude_patterns (list): Glob patterns matched against paths
+                relative to the root and against entry names; matching
+                files are skipped and matching directories are not
+                descended into.
         """
         if not os.path.isdir(root_path):
             raise ValueError(f"Invalid root path: {root_path} is not a directory.")
         self.root_path = root_path
+        self.exclude_patterns = list(exclude_patterns or [])
         self.graph = nx.DiGraph()  # Directed graph for permission dependencies
         self.console = Console()
         self.build_permission_graph()
+
+    def is_excluded(self, path):
+        """Returns True when a path matches any --exclude pattern."""
+        if not self.exclude_patterns:
+            return False
+        relative = os.path.relpath(path, self.root_path)
+        name = os.path.basename(path)
+        for pattern in self.exclude_patterns:
+            if fnmatch.fnmatch(relative, pattern) or fnmatch.fnmatch(name, pattern):
+                return True
+            if "/" not in pattern and any(
+                fnmatch.fnmatch(part, pattern) for part in relative.split(os.sep)
+            ):
+                return True
+        return False
 
     def build_permission_graph(self):
         """
@@ -51,11 +70,17 @@ class PermissionExposureAnalyzer:
         Nodes represent files/directories, and edges represent permission relationships.
         """
         logging.info(f"Building permission graph starting from: {self.root_path}")
-        for root, _, files in os.walk(self.root_path):
+        for root, dirs, files in os.walk(self.root_path):
+            dirs[:] = [
+                d for d in dirs if not self.is_excluded(os.path.join(root, d))
+            ]
             # Add directory node
             self.add_node(root, "directory")
             for file in files:
                 file_path = os.path.join(root, file)
+                if self.is_excluded(file_path):
+                    logging.debug(f"Excluded from analysis: {file_path}")
+                    continue
                 self.add_node(file_path, "file")
                 self.add_edge(root, file_path, "contains")  # Directory contains file
                 self.analyze_file_permissions(file_path)  # Analyze specific file permissions
@@ -81,9 +106,26 @@ class PermissionExposureAnalyzer:
             target (str): The target node path.
             relation (str): The type of relationship (e.g., "contains", "read_access").
         """
-        if not self.graph.has_edge(source, target):
-            self.graph.add_edge(source, target, relation=relation)
+        existing = (
+            self.graph.get_edge_data(source, target)
+            if self.graph.has_edge(source, target)
+            else None
+        )
+        if existing is None:
+            self.graph.add_edge(source, target, relation=relation, relations=[relation])
             logging.debug(f"Added edge: {source} -> {target} (relation: {relation})")
+            return
+        # One directed edge can carry several permission relations (a file
+        # can be both readable and writable by the same principal), so the
+        # relations are kept together on the edge instead of dropping all
+        # but the first.
+        relations = list(existing.get("relations", [existing.get("relation")]))
+        if relation not in relations:
+            relations.append(relation)
+            self.graph.add_edge(
+                source, target, relation=existing.get("relation"), relations=relations
+            )
+            logging.debug(f"Added relation to edge: {source} -> {target} (relation: {relation})")
 
     def analyze_file_permissions(self, file_path):
         """
@@ -139,7 +181,11 @@ class PermissionExposureAnalyzer:
         """
         affected_nodes = []
         for node in self.graph.nodes():
-            if self.graph.has_edge(principal, node, relation=permission):
+            edge_data = self.graph.get_edge_data(principal, node)
+            if not edge_data:
+                continue
+            relations = edge_data.get("relations", [edge_data.get("relation")])
+            if permission in relations:
                 affected_nodes.append(node)
         return affected_nodes
 
@@ -196,13 +242,15 @@ def setup_argparse():
     parser.add_argument(
         "--principal",
         default="owner",
-        help="The principal to analyze (e.g., owner, group, others). Defaults to owner."
+        choices=["owner", "group", "others"],
+        help="The principal to analyze: owner, group, or others. Defaults to owner."
     )
 
     parser.add_argument(
         "--permission",
         default="read",
-        help="The permission to analyze (e.g., read, write, execute). Defaults to read."
+        choices=["read", "write", "execute"],
+        help="The permission to analyze: read, write, or execute. Defaults to read."
     )
 
     parser.add_argument(
@@ -215,7 +263,7 @@ def setup_argparse():
     parser.add_argument(
         "--exclude",
         nargs="*",
-        help="List of patterns to exclude from analysis (using gitignore syntax)."
+        help="List of glob patterns to exclude from analysis. A pattern is matched against each path relative to the root and against each entry name; matching files are skipped and matching directories are not descended into."
     )
 
     return parser
@@ -232,7 +280,7 @@ def main():
     logging.getLogger().setLevel(args.log_level)
 
     try:
-        analyzer = PermissionExposureAnalyzer(args.root_path)
+        analyzer = PermissionExposureAnalyzer(args.root_path, args.exclude)
         analyzer.run_analysis(args.principal, args.permission)
 
     except ValueError as e:
